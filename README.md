@@ -4,6 +4,8 @@ A small privacy/safety camera recorder for hotel rooms or temporary spaces.
 
 It records from your webcam, shows a clear terminal recording state, and lets you stop recording with a single key while safely writing the video to disk.
 
+<img width="833" height="873" alt="image" src="https://github.com/user-attachments/assets/0342a9a1-df54-4db4-be5d-26aa8a07536c" />
+
 ## Features
 
 - Clear status while active: blinking `[REC]/[rec]` in terminal.
