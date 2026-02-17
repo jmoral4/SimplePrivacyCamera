@@ -205,6 +205,11 @@ Analyze a recorded MP4 for notable events (motion spikes, scene changes, people,
 - JSON event data
 - a standalone HTML timeline report with clickable markers that seek to each event
 
+Person detection behavior:
+
+- DNN (default): uses an ONNX model (`models/yolo11n.onnx`) for faster, more accurate modern object detection.
+- HOG fallback: if the ONNX model/runtime cannot load, it falls back to OpenCV's classic Histogram of Oriented Gradients pedestrian detector.
+
 Run:
 
 ```bash
