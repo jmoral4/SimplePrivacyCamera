@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -14,12 +15,17 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from html import escape
 from statistics import fmean, median, pstdev
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 try:
     import cv2
 except ModuleNotFoundError:
     cv2 = None
+
+try:
+    import onnxruntime as ort
+except ModuleNotFoundError:
+    ort = None
 
 
 @dataclass
@@ -34,11 +40,26 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Auto-scrub MP4 video for visual/audio events and generate a timeline report"
     )
-    parser.add_argument("video", help="Path to MP4 video")
+    parser.add_argument("video", nargs="?", help="Path to MP4 video")
     parser.add_argument(
         "--output-dir",
         default="scrub_reports",
         help="Directory to write JSON + HTML outputs (default: scrub_reports)",
+    )
+    parser.add_argument(
+        "--regen-from-json",
+        default=None,
+        help="Regenerate HTML only from an existing *_events_*.json file",
+    )
+    parser.add_argument(
+        "--regen-from-output-dir",
+        default=None,
+        help="Regenerate HTML only from newest *_events_*.json in this directory",
+    )
+    parser.add_argument(
+        "--html-video-src",
+        default=None,
+        help="Optional video path/URL to embed in regenerated HTML",
     )
     parser.add_argument(
         "--sample-fps",
@@ -97,6 +118,46 @@ def parse_args() -> argparse.Namespace:
         "--skip-people",
         action="store_true",
         help="Skip person detection step",
+    )
+    parser.add_argument(
+        "--person-model",
+        default="models/yolo11n.onnx",
+        help="Path to ONNX person-capable detector (default: models/yolo11n.onnx)",
+    )
+    parser.add_argument(
+        "--person-conf-threshold",
+        type=float,
+        default=0.20,
+        help="Confidence threshold for person detection (default: 0.20)",
+    )
+    parser.add_argument(
+        "--person-nms-threshold",
+        type=float,
+        default=0.45,
+        help="NMS IoU threshold for person detection (default: 0.45)",
+    )
+    parser.add_argument(
+        "--person-input-size",
+        type=int,
+        default=640,
+        help="Model input size for ONNX detector (default: 640)",
+    )
+    parser.add_argument(
+        "--person-bottom-roi",
+        type=float,
+        default=0.45,
+        help="Fraction of frame height for extra bottom ROI pass (default: 0.45)",
+    )
+    parser.add_argument(
+        "--person-roi-upscale",
+        type=float,
+        default=1.6,
+        help="Upscale factor for bottom ROI before detection (default: 1.6)",
+    )
+    parser.add_argument(
+        "--require-people-model",
+        action="store_true",
+        help="Fail if ONNX person model cannot be loaded instead of falling back to HOG",
     )
     return parser.parse_args()
 
@@ -258,6 +319,13 @@ def analyze_video(
     cooldown_sec: float,
     max_seconds: Optional[float],
     skip_people: bool,
+    person_model: str,
+    person_conf_threshold: float,
+    person_nms_threshold: float,
+    person_input_size: int,
+    person_bottom_roi: float,
+    person_roi_upscale: float,
+    require_people_model: bool,
 ) -> Dict[str, object]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -275,10 +343,259 @@ def analyze_video(
     sample_every_frames = max(1, int(round(fps / max(sample_fps, 0.1))))
     people_every_frames = max(1, int(round(fps * max(people_every_sec, 0.1))))
 
+    def clamp(val: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, val))
+
+    def nms_xywh(
+        boxes: Sequence[Tuple[int, int, int, int]],
+        scores: Sequence[float],
+        conf_threshold: float,
+        nms_threshold: float,
+    ) -> Tuple[List[Tuple[int, int, int, int]], List[float]]:
+        if not boxes:
+            return [], []
+        idxs = cv2.dnn.NMSBoxes(
+            bboxes=[[int(x), int(y), int(w), int(h)] for (x, y, w, h) in boxes],
+            scores=[float(s) for s in scores],
+            score_threshold=float(conf_threshold),
+            nms_threshold=float(nms_threshold),
+        )
+        if idxs is None or len(idxs) == 0:
+            return [], []
+        flat: List[int] = []
+        for idx in idxs:
+            if isinstance(idx, (list, tuple)):
+                flat.append(int(idx[0]))
+            else:
+                flat.append(int(idx))
+        out_boxes = [boxes[i] for i in flat]
+        out_scores = [float(scores[i]) for i in flat]
+        return out_boxes, out_scores
+
+    def decode_yolo_person_predictions(
+        raw_preds,
+        image_w: int,
+        image_h: int,
+        conf_threshold: float,
+        input_size: int,
+    ) -> Tuple[List[Tuple[int, int, int, int]], List[float]]:
+        preds = raw_preds
+        if isinstance(preds, (list, tuple)):
+            if not preds:
+                return [], []
+            preds = preds[0]
+        if preds is None or not hasattr(preds, "shape"):
+            return [], []
+        if len(preds.shape) == 3:
+            preds = preds[0]
+        if len(preds.shape) != 2:
+            return [], []
+
+        # Ultralytics ONNX frequently exports as [84, N]; transpose to [N, 84].
+        if preds.shape[0] < preds.shape[1]:
+            preds = preds.transpose()
+        if preds.shape[1] < 5:
+            return [], []
+
+        boxes: List[Tuple[int, int, int, int]] = []
+        scores: List[float] = []
+        for row in preds:
+            # Supports YOLOv8/v11 style [cx, cy, w, h, cls...].
+            cx, cy, bw, bh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+            class_scores = row[4:]
+            if class_scores.size == 0:
+                continue
+
+            person_score = float(class_scores[0])  # COCO class 0 = person
+            if person_score < conf_threshold:
+                continue
+
+            # Handle either normalized [0,1] or input-scale [0,input_size] coords.
+            if max(abs(cx), abs(cy), abs(bw), abs(bh)) <= 2.5:
+                x = int((cx - bw / 2.0) * image_w)
+                y = int((cy - bh / 2.0) * image_h)
+                ww = int(bw * image_w)
+                hh = int(bh * image_h)
+            else:
+                sx = float(image_w) / float(input_size)
+                sy = float(image_h) / float(input_size)
+                x = int((cx - bw / 2.0) * sx)
+                y = int((cy - bh / 2.0) * sy)
+                ww = int(bw * sx)
+                hh = int(bh * sy)
+
+            if ww <= 2 or hh <= 2:
+                continue
+
+            x = int(clamp(float(x), 0.0, float(max(0, image_w - 1))))
+            y = int(clamp(float(y), 0.0, float(max(0, image_h - 1))))
+            ww = int(clamp(float(ww), 1.0, float(max(1, image_w - x))))
+            hh = int(clamp(float(hh), 1.0, float(max(1, image_h - y))))
+
+            boxes.append((x, y, ww, hh))
+            scores.append(person_score)
+
+        return boxes, scores
+
+    def run_yolo_person_pass_cv2(
+        net,
+        image_bgr,
+        conf_threshold: float,
+        input_size: int,
+    ) -> Tuple[List[Tuple[int, int, int, int]], List[float]]:
+        h, w = image_bgr.shape[:2]
+        if h <= 0 or w <= 0:
+            return [], []
+
+        blob = cv2.dnn.blobFromImage(
+            image_bgr,
+            scalefactor=1.0 / 255.0,
+            size=(int(input_size), int(input_size)),
+            mean=(0, 0, 0),
+            swapRB=True,
+            crop=False,
+        )
+        net.setInput(blob)
+        outs = net.forward()
+        return decode_yolo_person_predictions(
+            raw_preds=outs,
+            image_w=w,
+            image_h=h,
+            conf_threshold=conf_threshold,
+            input_size=input_size,
+        )
+
+    def run_yolo_person_pass_ort(
+        session,
+        input_name: str,
+        image_bgr,
+        conf_threshold: float,
+        input_size: int,
+    ) -> Tuple[List[Tuple[int, int, int, int]], List[float]]:
+        h, w = image_bgr.shape[:2]
+        if h <= 0 or w <= 0:
+            return [], []
+
+        blob = cv2.dnn.blobFromImage(
+            image_bgr,
+            scalefactor=1.0 / 255.0,
+            size=(int(input_size), int(input_size)),
+            mean=(0, 0, 0),
+            swapRB=True,
+            crop=False,
+        )
+        outputs = session.run(None, {input_name: blob})
+        return decode_yolo_person_predictions(
+            raw_preds=outputs,
+            image_w=w,
+            image_h=h,
+            conf_threshold=conf_threshold,
+            input_size=input_size,
+        )
+
+    def detect_people_with_runner(
+        pass_runner: Callable[[object, float, int], Tuple[List[Tuple[int, int, int, int]], List[float]]],
+        frame_bgr,
+        conf_threshold: float,
+        nms_threshold: float,
+        input_size: int,
+        bottom_roi: float,
+        roi_upscale: float,
+    ) -> Tuple[List[Tuple[int, int, int, int]], List[float]]:
+        h, _ = frame_bgr.shape[:2]
+        all_boxes, all_scores = pass_runner(frame_bgr, conf_threshold, input_size)
+
+        bottom_roi = clamp(bottom_roi, 0.0, 1.0)
+        roi_upscale = max(1.0, float(roi_upscale))
+        if bottom_roi > 0.0:
+            roi_h = int(max(1, round(h * bottom_roi)))
+            y0 = max(0, h - roi_h)
+            roi = frame_bgr[y0:h, :]
+            if roi.shape[0] > 0 and roi.shape[1] > 0:
+                roi_input = roi
+                if roi_upscale > 1.0:
+                    roi_input = cv2.resize(
+                        roi,
+                        None,
+                        fx=roi_upscale,
+                        fy=roi_upscale,
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                roi_boxes, roi_scores = pass_runner(roi_input, conf_threshold, input_size)
+                for (x, y, ww, hh), score in zip(roi_boxes, roi_scores):
+                    if roi_upscale > 1.0:
+                        x = int(round(x / roi_upscale))
+                        y = int(round(y / roi_upscale))
+                        ww = int(round(ww / roi_upscale))
+                        hh = int(round(hh / roi_upscale))
+                    all_boxes.append((x, y + y0, ww, hh))
+                    all_scores.append(score)
+
+        return nms_xywh(
+            boxes=all_boxes,
+            scores=all_scores,
+            conf_threshold=conf_threshold,
+            nms_threshold=nms_threshold,
+        )
+
     hog = None
+    dnn_net = None
+    ort_session = None
+    ort_input_name: Optional[str] = None
+    person_detector = "disabled"
     if not skip_people:
-        hog = cv2.HOGDescriptor()
-        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        model_path = os.path.abspath(person_model)
+        if os.path.exists(model_path):
+            load_errors: List[str] = []
+            try:
+                dnn_net = cv2.dnn.readNet(model_path)
+                person_detector = "dnn"
+                print(f"Person detector: DNN (model={model_path})")
+            except Exception as exc:
+                dnn_net = None
+                load_errors.append(f"OpenCV DNN load failed: {exc}")
+
+            if dnn_net is None and ort is not None:
+                try:
+                    ort_session = ort.InferenceSession(
+                        model_path,
+                        providers=["CPUExecutionProvider"],
+                    )
+                    inputs = ort_session.get_inputs()
+                    if not inputs:
+                        raise RuntimeError("ONNX model has no inputs")
+                    ort_input_name = inputs[0].name
+                    person_detector = "onnxruntime"
+                    print(f"Person detector: ONNX Runtime (model={model_path})")
+                except Exception as exc:
+                    ort_session = None
+                    ort_input_name = None
+                    load_errors.append(f"ONNX Runtime load failed: {exc}")
+            elif dnn_net is None:
+                load_errors.append(
+                    "ONNX Runtime not installed. Install with: python -m pip install onnxruntime"
+                )
+
+            if dnn_net is None and ort_session is None:
+                print(f"Person detector: failed to load ONNX model at {model_path}")
+                for err in load_errors:
+                    print(f"  - {err}")
+                if require_people_model:
+                    raise RuntimeError("Failed to initialize person ONNX model")
+                print("Person detector: falling back to HOG")
+        else:
+            msg = f"Person detector: model file not found at {model_path}"
+            if require_people_model:
+                raise RuntimeError(msg)
+            print(f"{msg}; falling back to HOG")
+
+        if dnn_net is None and ort_session is None:
+            hog = cv2.HOGDescriptor()
+            hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+            person_detector = "hog"
+            print("Person detector: HOG fallback active")
+    else:
+        print("Person detector: disabled (--skip-people)")
 
     events: List[Event] = []
     prev_gray = None
@@ -299,6 +616,72 @@ def analyze_video(
         current_time = frame_idx / fps
         if max_seconds is not None and current_time > max_seconds:
             break
+
+        if not skip_people and frame_idx % people_every_frames == 0:
+            person_count = 0
+            confidence = 0.0
+            if dnn_net is not None or (ort_session is not None and ort_input_name is not None):
+                try:
+                    if dnn_net is not None:
+                        pass_runner = lambda image, conf, inp: run_yolo_person_pass_cv2(
+                            dnn_net, image, conf, inp
+                        )
+                    else:
+                        pass_runner = lambda image, conf, inp: run_yolo_person_pass_ort(
+                            ort_session, ort_input_name, image, conf, inp
+                        )
+
+                    person_boxes, person_scores = detect_people_with_runner(
+                        pass_runner=pass_runner,
+                        frame_bgr=frame,
+                        conf_threshold=max(0.01, float(person_conf_threshold)),
+                        nms_threshold=clamp(float(person_nms_threshold), 0.05, 0.95),
+                        input_size=max(160, int(person_input_size)),
+                        bottom_roi=float(person_bottom_roi),
+                        roi_upscale=max(1.0, float(person_roi_upscale)),
+                    )
+                    person_count = len(person_boxes)
+                    confidence = max(person_scores, default=0.0)
+                except Exception as exc:
+                    print(
+                        f"Warning: {person_detector} person detection failed at {current_time:.2f}s "
+                        f"({exc}). Falling back to HOG."
+                    )
+                    dnn_net = None
+                    ort_session = None
+                    ort_input_name = None
+                    if hog is None:
+                        hog = cv2.HOGDescriptor()
+                        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+                    person_detector = "hog"
+            elif hog is not None:
+                display = frame
+                if frame.shape[1] > 640:
+                    scale = 640.0 / float(frame.shape[1])
+                    display = cv2.resize(frame, (640, int(frame.shape[0] * scale)))
+                rects, weights = hog.detectMultiScale(
+                    display,
+                    winStride=(8, 8),
+                    padding=(8, 8),
+                    scale=1.05,
+                )
+                person_count = int(len(rects))
+                confidence = max([float(w) for w in weights], default=0.0)
+
+            if person_count > 0 and current_time - last_event_by_type["person"] >= cooldown_sec:
+                details = (
+                    f"Detected {person_count} person(s)"
+                    f" [{person_detector}, conf={confidence:.2f}]"
+                )
+                events.append(
+                    Event(
+                        time_sec=current_time,
+                        event_type="person",
+                        score=float(confidence),
+                        details=details,
+                    )
+                )
+                last_event_by_type["person"] = current_time
 
         if frame_idx % sample_every_frames != 0:
             continue
@@ -336,31 +719,6 @@ def analyze_video(
                 )
                 last_event_by_type["scene_change"] = current_time
 
-        if hog is not None and frame_idx % people_every_frames == 0:
-            display = frame
-            if frame.shape[1] > 640:
-                scale = 640.0 / float(frame.shape[1])
-                display = cv2.resize(frame, (640, int(frame.shape[0] * scale)))
-
-            rects, weights = hog.detectMultiScale(
-                display,
-                winStride=(8, 8),
-                padding=(8, 8),
-                scale=1.05,
-            )
-            person_count = int(len(rects))
-            if person_count > 0 and current_time - last_event_by_type["person"] >= cooldown_sec:
-                confidence = max([float(w) for w in weights], default=0.0)
-                events.append(
-                    Event(
-                        time_sec=current_time,
-                        event_type="person",
-                        score=confidence,
-                        details=f"Detected {person_count} person(s)",
-                    )
-                )
-                last_event_by_type["person"] = current_time
-
         prev_gray = gray
         prev_hist = hist
 
@@ -372,6 +730,7 @@ def analyze_video(
         "frame_count": frame_count,
         "duration_sec": duration_sec,
         "events": events,
+        "person_detector": person_detector,
     }
 
 
@@ -391,6 +750,7 @@ def generate_html_report(
 
     event_rows = []
     marker_divs = []
+    people_marker_divs = []
     for event in events:
         pct = (event.time_sec / duration_sec * 100.0) if duration_sec > 0 else 0.0
         pct = max(0.0, min(100.0, pct))
@@ -405,6 +765,12 @@ def generate_html_report(
             f'<div class="marker" style="left:{pct:.3f}%; background:{color};" '
             f'onclick="seekTo({event.time_sec:.3f})" title="{escape(label)}"></div>'
         )
+        if event.event_type == "person":
+            people_marker_divs.append(
+                f'<div class="marker marker-person" style="left:{pct:.3f}%;" '
+                f'data-people-time="{event.time_sec:.3f}" '
+                f'onclick="seekTo({event.time_sec:.3f})" title="{escape(label)}"></div>'
+            )
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -435,6 +801,10 @@ h1 {{ margin: 0 0 8px; font-size: 1.2rem; }}
 video {{ width: 100%; border-radius: 10px; border: 1px solid #3b4e7e; background: black; }}
 .timeline {{ position: relative; height: 24px; border-radius: 999px; margin: 12px 0 8px; background: var(--track); border: 1px solid #32456f; }}
 .marker {{ position: absolute; top: 2px; width: 6px; height: 18px; border-radius: 3px; cursor: pointer; transform: translateX(-50%); }}
+.people-wrap {{ margin: 6px 0 10px; }}
+.people-title {{ color: var(--muted); font-size: 0.85rem; margin: 6px 0 6px; }}
+.timeline.people {{ height: 28px; background: #15284f; border-color: #4167a3; }}
+.marker-person {{ top: 2px; width: 8px; height: 22px; border-radius: 4px; background: #2563eb; }}
 .legend {{ color: var(--muted); font-size: 0.85rem; margin: 8px 0 10px; }}
 .list {{ display: grid; grid-template-columns: 1fr; gap: 8px; max-height: 300px; overflow-y: auto; }}
 .event-row {{
@@ -473,14 +843,24 @@ video {{ width: 100%; border-radius: 10px; border: 1px solid #3b4e7e; background
         <button onclick="jump(-1)">-1s</button>
         <button onclick="jump(1)">+1s</button>
         <button onclick="jump(5)">+5s</button>
+        <button onclick="jumpToPerson(-1)">Prev Person</button>
+        <button onclick="jumpToPerson(1)">Next Person</button>
       </div>
       <div class="timeline" id="timeline">{''.join(marker_divs)}</div>
+      <div class="people-wrap">
+        <div class="people-title">People Scrub Timeline</div>
+        <div class="timeline people" id="peopleTimeline">{''.join(people_marker_divs)}</div>
+      </div>
       <div class="legend">Click a marker or event row to seek playback.</div>
       <div class="list">{''.join(event_rows) if event_rows else '<div class="meta">No events detected.</div>'}</div>
     </div>
   </div>
 <script>
 const player = document.getElementById('player');
+const peopleTimes = Array.from(document.querySelectorAll('[data-people-time]'))
+  .map(el => Number(el.getAttribute('data-people-time')))
+  .filter(Number.isFinite)
+  .sort((a, b) => a - b);
 function seekTo(seconds) {{
   player.currentTime = seconds;
   player.play().catch(() => {{}});
@@ -488,6 +868,22 @@ function seekTo(seconds) {{
 function jump(delta) {{
   const next = Math.max(0, player.currentTime + delta);
   player.currentTime = next;
+}}
+function jumpToPerson(direction) {{
+  if (!peopleTimes.length) return;
+  const now = player.currentTime || 0;
+  if (direction > 0) {{
+    const next = peopleTimes.find(t => t > now + 0.05);
+    seekTo(next ?? peopleTimes[0]);
+    return;
+  }}
+  for (let i = peopleTimes.length - 1; i >= 0; i -= 1) {{
+    if (peopleTimes[i] < now - 0.05) {{
+      seekTo(peopleTimes[i]);
+      return;
+    }}
+  }}
+  seekTo(peopleTimes[peopleTimes.length - 1]);
 }}
 </script>
 </body>
@@ -498,8 +894,120 @@ function jump(delta) {{
         f.write(html)
 
 
+def parse_events_filename(json_path: str) -> Tuple[str, str]:
+    name = os.path.basename(json_path)
+    match = re.match(r"(.+)_events_(\d{8}_\d{6})\.json$", name)
+    if not match:
+        raise RuntimeError(
+            f"Expected file named like *_events_YYYYMMDD_HHMMSS.json, got: {name}"
+        )
+    return match.group(1), match.group(2)
+
+
+def find_latest_events_json(output_dir: str) -> Optional[str]:
+    if not os.path.isdir(output_dir):
+        return None
+    candidates: List[str] = []
+    for name in os.listdir(output_dir):
+        if re.match(r".+_events_\d{8}_\d{6}\.json$", name):
+            candidates.append(os.path.join(output_dir, name))
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def event_from_dict(raw: Dict[str, object]) -> Event:
+    return Event(
+        time_sec=float(raw.get("time_sec", 0.0)),
+        event_type=str(raw.get("event_type", "unknown")),
+        score=float(raw.get("score", 0.0)),
+        details=str(raw.get("details", "")),
+    )
+
+
+def regen_html_only(
+    output_dir: str,
+    regen_json: Optional[str],
+    regen_output_dir: Optional[str],
+    html_video_src: Optional[str],
+) -> int:
+    if regen_json:
+        json_path = os.path.abspath(regen_json)
+    else:
+        search_dir = os.path.abspath(regen_output_dir or output_dir)
+        latest = find_latest_events_json(search_dir)
+        if not latest:
+            print(f"No event JSON found in: {search_dir}")
+            return 1
+        json_path = latest
+
+    if not os.path.exists(json_path):
+        print(f"Event JSON not found: {json_path}")
+        return 1
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    raw_events = payload.get("events", [])
+    if not isinstance(raw_events, list):
+        print(f"Invalid events JSON format: {json_path}")
+        return 1
+
+    events = [event_from_dict(e) for e in raw_events if isinstance(e, dict)]
+    events.sort(key=lambda e: e.time_sec)
+
+    base, stamp = parse_events_filename(json_path)
+    html_path = os.path.join(os.path.dirname(json_path), f"{base}_timeline_{stamp}.html")
+
+    report_video_path = ""
+    if html_video_src:
+        report_video_path = os.path.abspath(html_video_src)
+    else:
+        candidate_browser = os.path.join(
+            os.path.dirname(json_path), f"{base}_browser_{stamp}.mp4"
+        )
+        source_video = str(payload.get("source_video", ""))
+        if os.path.exists(candidate_browser):
+            report_video_path = candidate_browser
+        elif source_video and os.path.exists(source_video):
+            report_video_path = source_video
+
+    if report_video_path:
+        video_src = os.path.relpath(report_video_path, os.path.dirname(html_path))
+    else:
+        video_src = ""
+
+    source_video_name = os.path.basename(str(payload.get("source_video", ""))) or "unknown"
+    duration_sec = float(payload.get("duration_sec", 0.0))
+    if duration_sec <= 0.0 and events:
+        duration_sec = max(e.time_sec for e in events)
+
+    generate_html_report(
+        report_path=html_path,
+        video_src=video_src,
+        duration_sec=duration_sec,
+        events=events,
+        source_video_name=source_video_name,
+    )
+    print(f"Regenerated timeline report: {html_path}")
+    print(f"Source events JSON: {json_path}")
+    return 0
+
+
 def main() -> int:
     args = parse_args()
+    if args.regen_from_json or args.regen_from_output_dir:
+        return regen_html_only(
+            output_dir=args.output_dir,
+            regen_json=args.regen_from_json,
+            regen_output_dir=args.regen_from_output_dir,
+            html_video_src=args.html_video_src,
+        )
+
+    if not args.video:
+        print("Missing input video path. Provide VIDEO or use --regen-from-json/--regen-from-output-dir.")
+        return 1
+
     if cv2 is None:
         print("Missing dependency: opencv-python")
         print("Install with: python3 -m pip install opencv-python")
@@ -521,6 +1029,13 @@ def main() -> int:
         cooldown_sec=max(0.1, args.cooldown_sec),
         max_seconds=args.max_seconds,
         skip_people=args.skip_people,
+        person_model=args.person_model,
+        person_conf_threshold=args.person_conf_threshold,
+        person_nms_threshold=args.person_nms_threshold,
+        person_input_size=max(160, args.person_input_size),
+        person_bottom_roi=max(0.0, min(1.0, args.person_bottom_roi)),
+        person_roi_upscale=max(1.0, args.person_roi_upscale),
+        require_people_model=args.require_people_model,
     )
     events: List[Event] = list(visual["events"])
 
@@ -566,6 +1081,7 @@ def main() -> int:
             "scene_change": sum(1 for e in events if e.event_type == "scene_change"),
             "person": sum(1 for e in events if e.event_type == "person"),
             "audio_spike": sum(1 for e in events if e.event_type == "audio_spike"),
+            "person_detector": visual.get("person_detector", "unknown"),
             "audio_notes": audio_notes,
         },
         "events": [asdict(e) for e in events],
